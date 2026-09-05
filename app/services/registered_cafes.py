@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import io
 import os
 import re
 import secrets
@@ -7,6 +8,7 @@ import uuid
 
 import cloudinary
 import cloudinary.uploader
+
 from fastapi import UploadFile
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -34,20 +36,17 @@ CLOUDINARY_API_SECRET = os.getenv(
 def configure_cloudinary():
     if not CLOUDINARY_CLOUD_NAME:
         raise RuntimeError(
-            "CLOUDINARY_CLOUD_NAME "
-            "environment variable is missing."
+            "CLOUDINARY_CLOUD_NAME environment variable is missing."
         )
 
     if not CLOUDINARY_API_KEY:
         raise RuntimeError(
-            "CLOUDINARY_API_KEY "
-            "environment variable is missing."
+            "CLOUDINARY_API_KEY environment variable is missing."
         )
 
     if not CLOUDINARY_API_SECRET:
         raise RuntimeError(
-            "CLOUDINARY_API_SECRET "
-            "environment variable is missing."
+            "CLOUDINARY_API_SECRET environment variable is missing."
         )
 
     cloudinary.config(
@@ -95,8 +94,7 @@ def generate_unique_slug(
             select(
                 RegisteredCafe
             ).where(
-                RegisteredCafe.slug
-                == slug
+                RegisteredCafe.slug == slug
             )
         )
 
@@ -139,11 +137,9 @@ def verify_password(
         stored_hash: str,
 ) -> bool:
     try:
-        salt_hex, hash_hex = (
-            stored_hash.split(
-                "$",
-                1,
-            )
+        salt_hex, hash_hex = stored_hash.split(
+            "$",
+            1,
         )
 
         salt = bytes.fromhex(
@@ -155,9 +151,7 @@ def verify_password(
         )
 
         actual_hash = hashlib.scrypt(
-            password.encode(
-                "utf-8"
-            ),
+            password.encode("utf-8"),
             salt=salt,
             n=16384,
             r=8,
@@ -187,6 +181,10 @@ async def save_uploaded_image(
         prefix: str,
 ) -> str:
 
+    # --------------------------------------------------------
+    # Validate MIME type
+    # --------------------------------------------------------
+
     if not image.content_type:
         raise ValueError(
             "Image content type is missing."
@@ -200,11 +198,19 @@ async def save_uploaded_image(
 
     if image.content_type not in allowed_types:
         raise ValueError(
-            "Only JPG, PNG, and WEBP "
-            "images are allowed."
+            "Only JPG, PNG, and WEBP images are allowed."
         )
 
+    # --------------------------------------------------------
+    # Read uploaded image
+    # --------------------------------------------------------
+
     contents = await image.read()
+
+    if not contents:
+        raise ValueError(
+            "Uploaded image is empty."
+        )
 
     max_size = (
             10 * 1024 * 1024
@@ -212,37 +218,76 @@ async def save_uploaded_image(
 
     if len(contents) > max_size:
         raise ValueError(
-            "Each image must be "
-            "smaller than 10 MB."
+            "Each image must be smaller than 10 MB."
         )
 
-    if len(contents) == 0:
-        raise ValueError(
-            "Uploaded image is empty."
-        )
+    # --------------------------------------------------------
+    # Configure Cloudinary
+    # --------------------------------------------------------
 
     configure_cloudinary()
+
+    # --------------------------------------------------------
+    # Cloudinary folder
+    # --------------------------------------------------------
+
+    folder = (
+        f"tuntunan/cafes/{cafe_id}"
+    )
 
     public_id = (
         f"{prefix}-"
         f"{uuid.uuid4().hex}"
     )
 
-    folder = (
-        f"tuntunan/cafes/"
-        f"{cafe_id}"
+    # --------------------------------------------------------
+    # Convert bytes into file-like object
+    # --------------------------------------------------------
+
+    image_buffer = io.BytesIO(
+        contents
     )
+
+    image_buffer.seek(0)
 
     try:
         print(
             "[CLOUDINARY] "
-            f"Uploading image for "
-            f"cafe {cafe_id}"
+            f"Uploading {image.filename} "
+            f"for cafe {cafe_id}"
+        )
+
+        print(
+            "[CLOUDINARY] "
+            f"Content type: {image.content_type}"
+        )
+
+        print(
+            "[CLOUDINARY] "
+            f"File size: {len(contents)} bytes"
+        )
+
+        print(
+            "[CLOUDINARY] "
+            f"Cloud name configured: "
+            f"{bool(CLOUDINARY_CLOUD_NAME)}"
+        )
+
+        print(
+            "[CLOUDINARY] "
+            f"API key configured: "
+            f"{bool(CLOUDINARY_API_KEY)}"
+        )
+
+        print(
+            "[CLOUDINARY] "
+            f"API secret configured: "
+            f"{bool(CLOUDINARY_API_SECRET)}"
         )
 
         result = await asyncio.to_thread(
             cloudinary.uploader.upload,
-            contents,
+            image_buffer,
             folder=folder,
             public_id=public_id,
             resource_type="image",
@@ -254,15 +299,23 @@ async def save_uploaded_image(
         )
 
         if not secure_url:
+            print(
+                "[CLOUDINARY] "
+                f"Unexpected response: {result}"
+            )
+
             raise RuntimeError(
-                "Cloudinary did not return "
-                "an image URL."
+                "Cloudinary did not return a secure_url."
             )
 
         print(
             "[CLOUDINARY] "
-            f"Upload successful: "
-            f"{secure_url}"
+            "Upload successful."
+        )
+
+        print(
+            "[CLOUDINARY] "
+            f"URL: {secure_url}"
         )
 
         return secure_url
@@ -270,10 +323,24 @@ async def save_uploaded_image(
     except Exception as error:
         print(
             "[CLOUDINARY] "
-            f"Upload failed: {error}"
+            f"Upload failed."
+        )
+
+        print(
+            "[CLOUDINARY] "
+            f"Error type: "
+            f"{type(error).__name__}"
+        )
+
+        print(
+            "[CLOUDINARY] "
+            f"Error message: "
+            f"{str(error)}"
         )
 
         raise RuntimeError(
-            "Unable to upload image "
-            "to Cloudinary."
+            "Unable to upload image to Cloudinary."
         ) from error
+
+    finally:
+        image_buffer.close()
