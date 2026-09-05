@@ -1,7 +1,12 @@
 import asyncio
+import time
 
 import httpx
 
+
+# ============================================================
+# NOMINATIM CONFIGURATION
+# ============================================================
 
 NOMINATIM_SEARCH_URL = (
     "https://nominatim.openstreetmap.org/search"
@@ -10,7 +15,7 @@ NOMINATIM_SEARCH_URL = (
 HEADERS = {
     "User-Agent": (
         "TuntunanCafeFinder/1.0 "
-        "(https://tuntunan.vercel.app)"
+        "(https://frontend-tuntunan.vercel.app)"
     ),
     "Accept": "application/json",
 }
@@ -22,8 +27,82 @@ REQUEST_TIMEOUT = httpx.Timeout(
     pool=10.0,
 )
 
-MAX_RETRIES = 2
 
+# ============================================================
+# RATE LIMITING
+# ============================================================
+
+# Public Nominatim requires no more than
+# approximately one request per second.
+MIN_REQUEST_INTERVAL = 1.1
+
+_request_lock = asyncio.Lock()
+_last_request_time = 0.0
+
+
+# ============================================================
+# SIMPLE IN-MEMORY CACHE
+# ============================================================
+
+CACHE_TTL_SECONDS = 60 * 60
+
+_location_cache: dict[
+    str,
+    tuple[float, list]
+] = {}
+
+
+def get_cache_key(
+        query: str,
+        limit: int,
+) -> str:
+    return (
+        f"{query.strip().lower()}"
+        f":{limit}"
+    )
+
+
+def get_cached_result(
+        key: str,
+):
+    cached = _location_cache.get(
+        key
+    )
+
+    if not cached:
+        return None
+
+    created_at, data = cached
+
+    age = (
+            time.monotonic()
+            - created_at
+    )
+
+    if age > CACHE_TTL_SECONDS:
+        _location_cache.pop(
+            key,
+            None,
+        )
+
+        return None
+
+    return data
+
+
+def set_cached_result(
+        key: str,
+        data: list,
+):
+    _location_cache[key] = (
+        time.monotonic(),
+        data,
+    )
+
+
+# ============================================================
+# SEARCH
+# ============================================================
 
 async def search_locations(
         query: str,
@@ -34,11 +113,27 @@ async def search_locations(
     if not query:
         return []
 
-    # Keep result count reasonable.
     limit = max(
         1,
         min(limit, 10),
     )
+
+    cache_key = get_cache_key(
+        query,
+        limit,
+    )
+
+    cached = get_cached_result(
+        cache_key
+    )
+
+    if cached is not None:
+        print(
+            "[NOMINATIM] "
+            f"Cache hit: {query}"
+        )
+
+        return cached
 
     params = {
         "q": query,
@@ -55,8 +150,13 @@ async def search_locations(
     locations = []
 
     for result in data:
-        latitude = result.get("lat")
-        longitude = result.get("lon")
+        latitude = result.get(
+            "lat"
+        )
+
+        longitude = result.get(
+            "lon"
+        )
 
         if (
                 latitude is None
@@ -74,9 +174,11 @@ async def search_locations(
                 "place_id": result.get(
                     "place_id"
                 ),
+
                 "osm_id": result.get(
                     "osm_id"
                 ),
+
                 "osm_type": result.get(
                     "osm_type"
                 ),
@@ -92,6 +194,7 @@ async def search_locations(
                 "latitude": float(
                     latitude
                 ),
+
                 "longitude": float(
                     longitude
                 ),
@@ -130,34 +233,72 @@ async def search_locations(
             }
         )
 
+    set_cached_result(
+        cache_key,
+        locations,
+    )
+
     return locations
 
+
+# ============================================================
+# NOMINATIM REQUEST
+# ============================================================
 
 async def request_nominatim(
         params: dict,
 ):
-    last_error = None
+    global _last_request_time
 
-    async with httpx.AsyncClient(
-            timeout=REQUEST_TIMEOUT,
-            headers=HEADERS,
-            follow_redirects=True,
-    ) as client:
+    async with _request_lock:
 
-        for attempt in range(
-                1,
-                MAX_RETRIES + 1,
-        ):
-            try:
+        # ----------------------------------------------------
+        # Respect Nominatim rate limit
+        # ----------------------------------------------------
+
+        now = time.monotonic()
+
+        elapsed = (
+                now
+                - _last_request_time
+        )
+
+        wait_time = (
+                MIN_REQUEST_INTERVAL
+                - elapsed
+        )
+
+        if wait_time > 0:
+            print(
+                "[NOMINATIM] "
+                f"Rate-limit wait: "
+                f"{wait_time:.2f}s"
+            )
+
+            await asyncio.sleep(
+                wait_time
+            )
+
+        try:
+            async with httpx.AsyncClient(
+                    timeout=REQUEST_TIMEOUT,
+                    headers=HEADERS,
+                    follow_redirects=True,
+            ) as client:
+
                 print(
                     "[NOMINATIM] "
-                    f"Search attempt "
-                    f"{attempt}/{MAX_RETRIES}"
+                    f"Searching: "
+                    f"{params.get('q')}"
                 )
 
                 response = await client.get(
                     NOMINATIM_SEARCH_URL,
                     params=params,
+                )
+
+                _last_request_time = (
+                    time.monotonic()
                 )
 
                 print(
@@ -166,33 +307,47 @@ async def request_nominatim(
                     f"{response.status_code}"
                 )
 
+                # ------------------------------------------------
+                # Rate limited
+                # ------------------------------------------------
+
                 if response.status_code == 429:
-                    print(
-                        "[NOMINATIM] "
-                        "Rate limited by server."
+                    retry_after = (
+                        response.headers.get(
+                            "Retry-After"
+                        )
                     )
 
-                    response.raise_for_status()
+                    print(
+                        "[NOMINATIM] "
+                        "Rate limited."
+                    )
+
+                    if retry_after:
+                        print(
+                            "[NOMINATIM] "
+                            f"Retry-After: "
+                            f"{retry_after}"
+                        )
+
+                    raise NominatimRateLimitError(
+                        "Location search is temporarily "
+                        "rate limited."
+                    )
+
+                # ------------------------------------------------
+                # Temporary upstream failure
+                # ------------------------------------------------
 
                 if response.status_code in {
                     502,
                     503,
                     504,
                 }:
-                    last_error = (
-                        httpx.HTTPStatusError(
-                            "Temporary Nominatim "
-                            "server error",
-                            request=response.request,
-                            response=response,
-                        )
+                    raise NominatimUnavailableError(
+                        "Location search provider "
+                        "is temporarily unavailable."
                     )
-
-                    if attempt < MAX_RETRIES:
-                        await asyncio.sleep(2)
-                        continue
-
-                    raise last_error
 
                 response.raise_for_status()
 
@@ -202,8 +357,9 @@ async def request_nominatim(
                         data,
                         list,
                 ):
-                    raise RuntimeError(
-                        "Invalid Nominatim response."
+                    raise NominatimUnavailableError(
+                        "Invalid response from "
+                        "location search provider."
                     )
 
                 print(
@@ -214,65 +370,81 @@ async def request_nominatim(
 
                 return data
 
-            except httpx.TimeoutException as error:
-                print(
-                    "[NOMINATIM] "
-                    f"Timeout: {error}"
-                )
+        except NominatimRateLimitError:
+            raise
 
-                last_error = error
+        except NominatimUnavailableError:
+            raise
 
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(2)
-                    continue
+        except httpx.TimeoutException as error:
+            print(
+                "[NOMINATIM] "
+                f"Timeout: {error}"
+            )
 
-            except httpx.HTTPStatusError as error:
-                print(
-                    "[NOMINATIM] "
-                    f"HTTP error: {error}"
-                )
+            raise NominatimUnavailableError(
+                "Location search timed out."
+            ) from error
 
-                last_error = error
+        except httpx.HTTPStatusError as error:
+            print(
+                "[NOMINATIM] "
+                f"HTTP error: {error}"
+            )
 
-                break
+            raise NominatimUnavailableError(
+                "Location search provider "
+                "returned an error."
+            ) from error
 
-            except httpx.RequestError as error:
-                print(
-                    "[NOMINATIM] "
-                    f"Connection error: {error}"
-                )
+        except httpx.RequestError as error:
+            print(
+                "[NOMINATIM] "
+                f"Connection error: {error}"
+            )
 
-                last_error = error
+            raise NominatimUnavailableError(
+                "Could not connect to "
+                "location search provider."
+            ) from error
 
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(2)
-                    continue
+        except ValueError as error:
+            print(
+                "[NOMINATIM] "
+                f"Invalid JSON: {error}"
+            )
 
-            except (
-                    ValueError,
-                    RuntimeError,
-            ) as error:
-                print(
-                    "[NOMINATIM] "
-                    f"Invalid response: {error}"
-                )
+            raise NominatimUnavailableError(
+                "Invalid location search response."
+            ) from error
 
-                last_error = error
 
-                break
+# ============================================================
+# CUSTOM ERRORS
+# ============================================================
 
-    if last_error:
-        raise last_error
+class NominatimRateLimitError(
+    RuntimeError
+):
+    pass
 
-    raise RuntimeError(
-        "Nominatim request failed."
-    )
 
+class NominatimUnavailableError(
+    RuntimeError
+):
+    pass
+
+
+# ============================================================
+# LOCATION NAME
+# ============================================================
 
 def get_location_name(
         result: dict,
 ):
-    name = result.get("name")
+    name = result.get(
+        "name"
+    )
 
     if name:
         return name.strip()

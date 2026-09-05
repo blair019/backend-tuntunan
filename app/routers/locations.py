@@ -4,9 +4,9 @@ from fastapi import (
     Query,
 )
 
-import httpx
-
 from app.services.nominatim import (
+    NominatimRateLimitError,
+    NominatimUnavailableError,
     search_locations,
 )
 
@@ -47,21 +47,36 @@ async def location_search(
             "locations": locations,
         }
 
-    except httpx.HTTPStatusError as error:
+    except NominatimRateLimitError as error:
         raise HTTPException(
-            status_code=502,
+            status_code=429,
             detail=(
-                "OpenStreetMap location "
-                "search failed: "
-                f"{error.response.status_code}"
+                "Location search is temporarily busy. "
+                "Please wait a moment and try again."
             ),
-        )
+        ) from error
 
-    except httpx.RequestError:
+    except NominatimUnavailableError as error:
         raise HTTPException(
             status_code=503,
             detail=(
-                "Could not connect to "
-                "OpenStreetMap location search."
+                "Location search is temporarily unavailable. "
+                "Please try again shortly."
             ),
+        ) from error
+
+    except Exception as error:
+        print(
+            "[LOCATIONS] "
+            f"Unexpected search error: "
+            f"{type(error).__name__}: "
+            f"{str(error)}"
         )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "An unexpected error occurred "
+                "while searching locations."
+            ),
+        ) from error
