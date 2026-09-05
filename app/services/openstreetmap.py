@@ -1,17 +1,21 @@
+import asyncio
 import math
 
 import httpx
 
 
 OVERPASS_URLS = [
+    "https://overpass.private.coffee/api/interpreter",
     "https://overpass-api.de/api/interpreter",
-    "https://overpass.kumi.systems/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 ]
 
 HEADERS = {
-    "User-Agent": "TuntunanCafeFinder/1.0 (development)",
+    "User-Agent": "TuntunanCafeFinder/1.0",
     "Accept": "application/json",
 }
+
+MAX_RETRIES_PER_SERVER = 2
 
 
 async def search_nearby_cafes(
@@ -20,7 +24,7 @@ async def search_nearby_cafes(
         radius: int = 3000,
 ):
     query = f"""
-    [out:json][timeout:25];
+    [out:json][timeout:30];
 
     (
       node["amenity"="cafe"](around:{radius},{latitude},{longitude});
@@ -51,7 +55,10 @@ async def search_nearby_cafes(
         if latitude_value is None or longitude_value is None:
             continue
 
-        name = tags.get("name", "Unnamed Cafe").strip()
+        name = (
+                tags.get("name")
+                or "Unnamed Cafe"
+        ).strip()
 
         distance_meters = calculate_distance(
             latitude,
@@ -93,12 +100,14 @@ async def search_nearby_cafes(
 
         seen.add(duplicate_key)
 
-        has_contact_info = any([
-            phone,
-            website,
-            facebook,
-            instagram,
-        ])
+        has_contact_info = any(
+            [
+                phone,
+                website,
+                facebook,
+                instagram,
+            ]
+        )
 
         cafe = {
             "osm_id": element.get("id"),
@@ -179,46 +188,172 @@ async def request_overpass(
 ):
     last_error = None
 
+    timeout = httpx.Timeout(
+        connect=15.0,
+        read=60.0,
+        write=30.0,
+        pool=15.0,
+    )
+
     async with httpx.AsyncClient(
-            timeout=httpx.Timeout(35.0),
+            timeout=timeout,
             headers=HEADERS,
+            follow_redirects=True,
     ) as client:
 
         for url in OVERPASS_URLS:
 
-            try:
-                print(
-                    f"Trying Overpass server: {url}"
-                )
+            for attempt in range(
+                    1,
+                    MAX_RETRIES_PER_SERVER + 1,
+            ):
+                try:
+                    print(
+                        f"[OVERPASS] "
+                        f"Trying {url} "
+                        f"(attempt {attempt}/"
+                        f"{MAX_RETRIES_PER_SERVER})"
+                    )
 
-                response = await client.post(
-                    url,
-                    data={
-                        "data": query,
-                    },
-                )
+                    response = await client.post(
+                        url,
+                        data={
+                            "data": query,
+                        },
+                    )
 
-                print(
-                    f"Overpass response: "
-                    f"{response.status_code} "
-                    f"from {url}"
-                )
+                    print(
+                        f"[OVERPASS] "
+                        f"{url} returned "
+                        f"{response.status_code}"
+                    )
 
-                response.raise_for_status()
+                    if response.status_code == 429:
+                        print(
+                            "[OVERPASS] "
+                            "Rate limited. "
+                            "Trying another server."
+                        )
 
-                return response.json()
+                        last_error = (
+                            httpx.HTTPStatusError(
+                                "Overpass rate limited",
+                                request=response.request,
+                                response=response,
+                            )
+                        )
 
-            except (
-                    httpx.HTTPStatusError,
-                    httpx.RequestError,
-            ) as error:
+                        break
 
-                print(
-                    f"Overpass server failed: "
-                    f"{url} -> {error}"
-                )
+                    if response.status_code in {
+                        502,
+                        503,
+                        504,
+                    }:
+                        print(
+                            f"[OVERPASS] "
+                            f"Temporary server error "
+                            f"{response.status_code}"
+                        )
 
-                last_error = error
+                        last_error = (
+                            httpx.HTTPStatusError(
+                                (
+                                    "Temporary Overpass "
+                                    "server error"
+                                ),
+                                request=response.request,
+                                response=response,
+                            )
+                        )
+
+                        if (
+                                attempt
+                                < MAX_RETRIES_PER_SERVER
+                        ):
+                            await asyncio.sleep(1.5)
+                            continue
+
+                        break
+
+                    response.raise_for_status()
+
+                    data = response.json()
+
+                    if not isinstance(
+                            data,
+                            dict,
+                    ):
+                        raise RuntimeError(
+                            "Invalid Overpass response."
+                        )
+
+                    print(
+                        f"[OVERPASS] "
+                        f"Success from {url}"
+                    )
+
+                    return data
+
+                except httpx.TimeoutException as error:
+                    print(
+                        f"[OVERPASS] "
+                        f"Timeout from {url}: "
+                        f"{error}"
+                    )
+
+                    last_error = error
+
+                    if (
+                            attempt
+                            < MAX_RETRIES_PER_SERVER
+                    ):
+                        await asyncio.sleep(1.5)
+                        continue
+
+                    break
+
+                except httpx.ConnectError as error:
+                    print(
+                        f"[OVERPASS] "
+                        f"Connection error from "
+                        f"{url}: {error}"
+                    )
+
+                    last_error = error
+
+                    break
+
+                except httpx.HTTPStatusError as error:
+                    print(
+                        f"[OVERPASS] "
+                        f"HTTP error from {url}: "
+                        f"{error}"
+                    )
+
+                    last_error = error
+
+                    break
+
+                except (
+                        httpx.RequestError,
+                        ValueError,
+                        RuntimeError,
+                ) as error:
+                    print(
+                        f"[OVERPASS] "
+                        f"Request failed from "
+                        f"{url}: {error}"
+                    )
+
+                    last_error = error
+
+                    break
+
+    print(
+        "[OVERPASS] "
+        "All Overpass servers failed."
+    )
 
     if last_error:
         raise last_error
@@ -266,9 +401,13 @@ def format_distance(
         distance_meters: float,
 ):
     if distance_meters < 1000:
-        return f"{round(distance_meters)} m"
+        return (
+            f"{round(distance_meters)} m"
+        )
 
-    return f"{distance_meters / 1000:.1f} km"
+    return (
+        f"{distance_meters / 1000:.1f} km"
+    )
 
 
 def build_address(
@@ -300,7 +439,11 @@ def parse_boolean(
     if not value:
         return None
 
-    value = str(value).lower().strip()
+    value = (
+        str(value)
+        .lower()
+        .strip()
+    )
 
     if value in [
         "yes",

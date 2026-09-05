@@ -1,9 +1,12 @@
+import asyncio
 import hashlib
 import os
 import re
 import secrets
 import uuid
 
+import cloudinary
+import cloudinary.uploader
 from fastapi import UploadFile
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -11,13 +14,57 @@ from sqlalchemy.orm import Session
 from app.models.cafe import RegisteredCafe
 
 
-UPLOAD_ROOT = os.path.join(
-    "uploads",
-    "cafes",
+# ============================================================
+# CLOUDINARY CONFIGURATION
+# ============================================================
+
+CLOUDINARY_CLOUD_NAME = os.getenv(
+    "CLOUDINARY_CLOUD_NAME"
+)
+
+CLOUDINARY_API_KEY = os.getenv(
+    "CLOUDINARY_API_KEY"
+)
+
+CLOUDINARY_API_SECRET = os.getenv(
+    "CLOUDINARY_API_SECRET"
 )
 
 
-def slugify(value: str) -> str:
+def configure_cloudinary():
+    if not CLOUDINARY_CLOUD_NAME:
+        raise RuntimeError(
+            "CLOUDINARY_CLOUD_NAME "
+            "environment variable is missing."
+        )
+
+    if not CLOUDINARY_API_KEY:
+        raise RuntimeError(
+            "CLOUDINARY_API_KEY "
+            "environment variable is missing."
+        )
+
+    if not CLOUDINARY_API_SECRET:
+        raise RuntimeError(
+            "CLOUDINARY_API_SECRET "
+            "environment variable is missing."
+        )
+
+    cloudinary.config(
+        cloud_name=CLOUDINARY_CLOUD_NAME,
+        api_key=CLOUDINARY_API_KEY,
+        api_secret=CLOUDINARY_API_SECRET,
+        secure=True,
+    )
+
+
+# ============================================================
+# SLUG HELPERS
+# ============================================================
+
+def slugify(
+        value: str,
+) -> str:
     value = value.lower().strip()
 
     value = re.sub(
@@ -62,6 +109,10 @@ def generate_unique_slug(
 
         counter += 1
 
+
+# ============================================================
+# PASSWORD HELPERS
+# ============================================================
 
 def hash_password(
         password: str,
@@ -126,51 +177,32 @@ def verify_password(
         return False
 
 
+# ============================================================
+# CLOUDINARY IMAGE UPLOAD
+# ============================================================
+
 async def save_uploaded_image(
         cafe_id: int,
         image: UploadFile,
         prefix: str,
 ) -> str:
+
     if not image.content_type:
         raise ValueError(
             "Image content type is missing."
         )
 
     allowed_types = {
-        "image/jpeg": ".jpg",
-        "image/png": ".png",
-        "image/webp": ".webp",
+        "image/jpeg",
+        "image/png",
+        "image/webp",
     }
 
-    extension = allowed_types.get(
-        image.content_type
-    )
-
-    if extension is None:
+    if image.content_type not in allowed_types:
         raise ValueError(
-            "Only JPG, PNG, and WEBP images are allowed."
+            "Only JPG, PNG, and WEBP "
+            "images are allowed."
         )
-
-    cafe_folder = os.path.join(
-        UPLOAD_ROOT,
-        str(cafe_id),
-    )
-
-    os.makedirs(
-        cafe_folder,
-        exist_ok=True,
-    )
-
-    filename = (
-        f"{prefix}-"
-        f"{uuid.uuid4().hex}"
-        f"{extension}"
-    )
-
-    path = os.path.join(
-        cafe_folder,
-        filename,
-    )
 
     contents = await image.read()
 
@@ -180,17 +212,68 @@ async def save_uploaded_image(
 
     if len(contents) > max_size:
         raise ValueError(
-            "Each image must be smaller than 10 MB."
+            "Each image must be "
+            "smaller than 10 MB."
         )
 
-    with open(
-            path,
-            "wb",
-    ) as file:
-        file.write(contents)
+    if len(contents) == 0:
+        raise ValueError(
+            "Uploaded image is empty."
+        )
 
-    return (
-        f"/uploads/cafes/"
-        f"{cafe_id}/"
-        f"{filename}"
+    configure_cloudinary()
+
+    public_id = (
+        f"{prefix}-"
+        f"{uuid.uuid4().hex}"
     )
+
+    folder = (
+        f"tuntunan/cafes/"
+        f"{cafe_id}"
+    )
+
+    try:
+        print(
+            "[CLOUDINARY] "
+            f"Uploading image for "
+            f"cafe {cafe_id}"
+        )
+
+        result = await asyncio.to_thread(
+            cloudinary.uploader.upload,
+            contents,
+            folder=folder,
+            public_id=public_id,
+            resource_type="image",
+            overwrite=False,
+        )
+
+        secure_url = result.get(
+            "secure_url"
+        )
+
+        if not secure_url:
+            raise RuntimeError(
+                "Cloudinary did not return "
+                "an image URL."
+            )
+
+        print(
+            "[CLOUDINARY] "
+            f"Upload successful: "
+            f"{secure_url}"
+        )
+
+        return secure_url
+
+    except Exception as error:
+        print(
+            "[CLOUDINARY] "
+            f"Upload failed: {error}"
+        )
+
+        raise RuntimeError(
+            "Unable to upload image "
+            "to Cloudinary."
+        ) from error
