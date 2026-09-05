@@ -2,7 +2,6 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
 from app.database import init_db
 
@@ -20,12 +19,20 @@ from app.routers.registered_cafes import (
 )
 
 
+# =========================================================
+# LIFESPAN
+# =========================================================
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
 
     yield
 
+
+# =========================================================
+# FASTAPI APP
+# =========================================================
 
 app = FastAPI(
     title="Tuntunan API",
@@ -39,28 +46,22 @@ app = FastAPI(
 # CORS
 # =========================================================
 
+allowed_origins = [
+    # Local development
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+
+    # Production frontend
+    "https://frontend-tuntunan.vercel.app",
+]
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://frontend-tuntunan.vercel.app/"
-    ],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-)
-
-
-# =========================================================
-# STATIC UPLOADS
-# =========================================================
-
-app.mount(
-    "/uploads",
-    StaticFiles(
-        directory="uploads"
-    ),
-    name="uploads",
 )
 
 
